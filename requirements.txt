@@ -1,26 +1,22 @@
-# Streamlit core
-streamlit>=1.29.0,<2
+# Core app
+streamlit==1.32.2
+numpy==1.26.4
+pandas==2.2.1
+matplotlib==3.8.3
+pillow==10.3.0
 
-# Image processing
-Pillow>=9.5.0,<10
-numpy>=1.22.0,<2
+# ML / inference
+torch==2.1.2
+torchvision==0.16.2
 
-# Optional ML / AI
-torch>=2.0.1,<2.3
-torchvision>=0.17.0,<0.18
-diffusers>=0.27.0,<0.28
-transformers>=4.36.0,<5.0
-accelerate>=0.23.0,<2.0
-timm>=0.9.0,<2.0
-scipy>=1.11.0,<2.0
+# Explainability
+shap==0.44.1
+scikit-learn==1.4.1.post1
 
-# Utilities
-rich>=14.2.0
-markdown-it-py>=4.0.0
-mdurl>=0.1.2
-pygments>=2.19.2
-validators>=0.20.0
-watchdog>=2.3.1
-zipp>=3.23.0
+# Model hub
+huggingface_hub==0.20.3
+
+# QoL
+tqdm==4.66.2
 
 
