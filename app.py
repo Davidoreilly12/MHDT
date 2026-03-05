@@ -14,27 +14,23 @@ from torchvision.models import swin_v2_b, Swin_V2_B_Weights
 from PIL import Image
 from huggingface_hub import hf_hub_download
 
-import shap
-
 # =========================================================
 # CONFIG
 # =========================================================
-HF_REPO = "DOReilly2/swin_regressor"             # Hugging Face repo for CLM extractor
+HF_REPO = "DOReilly2/swin_regressor"                  # Hugging Face repo for CLM extractor
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-WEIGHTS_DIR = "weights"                           # contains beta_pos.npy, beta_neg.npy, beta_r.npy
-MODELS_DIR  = "models"                            # contains DeepSets biomarker models
-CLM_SCALER_PATH = "env_scaler.pkl"  # optional {'mu':(7,), 'std':(7,)}
+MODELS_DIR  = "models"                                # DeepSets biomarker models
+WEIGHTS_DIR = "weights"                               # indices & betas (.npy); optional clm_scaler.pkl
+CLM_SCALER_PATH = "env_scaler.pkl"  # optional {'mu','std'} for 7-D CLM
 
-# UI controls
-TOPK_BIOMARKERS = st.sidebar.number_input("Top-K biomarkers (None=all)", min_value=0, max_value=10000, value=0, step=50)
-RUN_SHAPLEY      = st.sidebar.checkbox("Compute Monte-Carlo Shapley over image subsets", value=True)
-NUM_PERM         = st.sidebar.number_input("Shapley permutations", min_value=32, max_value=5000, value=512, step=32)
-SHAPLEY_SEED     = st.sidebar.number_input("Shapley random seed", min_value=0, max_value=10**6, value=42, step=1)
+# Sidebar controls
+st.sidebar.header("Monte-Carlo Shapley Controls")
+NUM_PERM      = st.sidebar.number_input("Permutations", min_value=32, max_value=5000, value=512, step=32)
+SHAPLEY_SEED  = st.sidebar.number_input("Random seed", min_value=0, max_value=10**6, value=42, step=1)
 
-RUN_CHANNEL_SHAP = st.sidebar.checkbox("Optional: channel-level SHAP (CLM → DeepSets → β·ŷ)", value=False)
-SHAP_BG_MAX      = st.sidebar.number_input("Channel SHAP background size", min_value=1, max_value=200, value=20, step=1)
-SHAP_NSAMPLES_TXT= st.sidebar.text_input("Channel SHAP nsamples (int or 'auto')", value="auto")
+st.sidebar.header("Biomarker Loading")
+SHOW_PROGRESS = st.sidebar.checkbox("Show per-biomarker loading progress", value=False)
 
 dimension_labels = [
     "Layers of the Landscape_embedding",
@@ -47,8 +43,13 @@ dimension_labels = [
 ]
 
 # =========================================================
-# UTILITIES
+# UTILS
 # =========================================================
+def zscore(v: np.ndarray) -> np.ndarray:
+    m = np.mean(v)
+    s = np.std(v) + 1e-8
+    return (v - m) / s
+
 def barplot(values: np.ndarray, labels: list, title: str):
     order = np.argsort(np.abs(values))[::-1]
     vals = values[order]
@@ -64,20 +65,15 @@ def barplot(values: np.ndarray, labels: list, title: str):
     ax.set_xlabel("Contribution")
     st.pyplot(fig)
 
-def zscore(v: np.ndarray) -> np.ndarray:
-    m = np.mean(v)
-    s = np.std(v) + 1e-8
-    return (v - m) / s
-
 # =========================================================
-# CLM EXTRACTOR
+# 1) CLM EXTRACTOR
 # =========================================================
 @st.cache_resource
 def load_context_embeddings():
     emb = {}
     for label in dimension_labels:
-        path = hf_hub_download(repo_id=HF_REPO, filename=f"context_embeddings/{label}.pt")
-        emb_t = torch.load(path, map_location="cpu")
+        p = hf_hub_download(repo_id=HF_REPO, filename=f"context_embeddings/{label}.pt")
+        emb_t = torch.load(p, map_location="cpu")
         emb[label] = emb_t.squeeze()
     return emb
 
@@ -102,39 +98,36 @@ class MultiContextSwinRegressor(nn.Module):
         })
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
-        # [B, 1024]
-        image_feat = self.swin(image)
+        image_feat = self.swin(image)  # [B,1024]
         outs = []
         for label in self.context_embeddings:
             ctx = self.context_embeddings[label].expand(image_feat.size(0), -1)
             fused = torch.cat([image_feat, ctx], dim=1)
-            score = self.fusion_heads[label](fused)  # [B,1]
+            score = self.fusion_headsfused  # [B,1]
             outs.append(score)
-        return torch.cat(outs, dim=1)  # [B, 7]
+        return torch.cat(outs, dim=1)     # [B,7]
 
 @st.cache_resource
 def load_clm_model():
-    model_path = hf_hub_download(repo_id=HF_REPO, filename="swin_regressor.pt")
-    state_dict = torch.load(model_path, map_location="cpu")
-    model = MultiContextSwinRegressor(CONTEXT_EMBEDDINGS)
-    model.load_state_dict(state_dict, strict=True)
-    model.to(DEVICE).eval()
+    path = hf_hub_download(repo_id=HF_REPO, filename="swin_regressor.pt")
+    sd = torch.load(path, map_location="cpu")
+    m = MultiContextSwinRegressor(CONTEXT_EMBEDDINGS)
+    m.load_state_dict(sd, strict=True)
+    m.to(DEVICE).eval()
     st.info("CLM model loaded.")
-    return model
+    return m
 
 CLM_MODEL = load_clm_model()
 
-def preprocess_image(image: Image.Image) -> torch.Tensor:
-    val_transform = transforms.Compose([
+def preprocess_image(img: Image.Image) -> torch.Tensor:
+    tfm = transforms.Compose([
         transforms.Resize((512, 512)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
     ])
-    image = image.convert("RGB")
-    return val_transform(image).unsqueeze(0).to(DEVICE)
+    img = img.convert("RGB")
+    return tfm(img).unsqueeze(0).to(DEVICE)
 
-# optional CLM standardization
 def maybe_load_clm_scaler():
     if os.path.exists(CLM_SCALER_PATH):
         with open(CLM_SCALER_PATH, "rb") as f:
@@ -157,30 +150,26 @@ def clm_to_elements(clm_vec: np.ndarray) -> np.ndarray:
     return elems
 
 # =========================================================
-# LOAD β VECTORS
+# 2) LOAD AFFECT SPECS (indices + betas), with 1→0 index shift
 # =========================================================
 @st.cache_resource
-def load_betas() -> Dict[str, np.ndarray]:
-    beta_pos = np.load(os.path.join(WEIGHTS_DIR, "beta_pos.npy")).astype(np.float32).reshape(-1)
-    beta_neg = np.load(os.path.join(WEIGHTS_DIR, "beta_neg.npy")).astype(np.float32).reshape(-1)
-    beta_r   = np.load(os.path.join(WEIGHTS_DIR, "beta_r.npy")).astype(np.float32).reshape(-1)
-    if not (len(beta_pos) == len(beta_neg) == len(beta_r)):
-        raise ValueError("beta_pos/neg/r must have the same length D.")
-    return {"positive": beta_pos, "negative": beta_neg, "r": beta_r}
+def load_affect_specs(weights_dir: str):
+    out = {}
+    for name in ["positive", "negative", "r"]:
+        idx = np.load(os.path.join(weights_dir, f"{name}_indices.npy")).astype(int)
+        betas = np.load(os.path.join(weights_dir, f"{name}_betas.npy")).astype(np.float32)
+        if len(idx) != len(betas):
+            raise ValueError(f"{name}: indices and betas length mismatch ({len(idx)} vs {len(betas)})")
+        idx = idx - 1  # 1-based -> 0-based
+        out[name] = (idx, betas)
+    return out
 
-BETAS = load_betas()
-D_FULL = len(BETAS["positive"])
+AFFECT_SPECS = load_affect_specs(WEIGHTS_DIR)
 
 # =========================================================
-# DEEPSETS LOADER (original biomarker models)
+# 3) DEEPSETS LOADER (original biomarker models)
 # =========================================================
 class DeepSet(nn.Module):
-    """
-    Must match your training code:
-      phi: MLP
-      attn: scalar gate
-      rho: MLP -> (mu, log_var) but we use mu only
-    """
     def __init__(self, input_dim=2, phi_dim=64, rho_dim=64):
         super().__init__()
         self.phi = nn.Sequential(
@@ -190,14 +179,12 @@ class DeepSet(nn.Module):
         self.attn = nn.Sequential(nn.Linear(phi_dim, 1), nn.Sigmoid())
         self.rho = nn.Sequential(
             nn.Linear(phi_dim, rho_dim), nn.ReLU(),
-            nn.Linear(rho_dim, 2)
+            nn.Linear(rho_dim, 2)  # [mu, log_var]
         )
-
     def forward(self, x: torch.Tensor):
-        # x: (T,2) elements
-        z = self.phi(x)                 # (T, phi_dim)
-        w = self.attn(z)                # (T, 1) in [0,1]
-        agg = (w * z).sum(dim=0)        # (phi_dim,)
+        z = self.phi(x)                 # (T,phi)
+        w = self.attn(z)                # (T,1)
+        agg = (w * z).sum(dim=0)        # (phi,)
         out = self.rho(agg)             # (2,)
         mu = out[0]
         log_var = torch.clamp(out[1], min=-3.0, max=3.0)
@@ -205,15 +192,13 @@ class DeepSet(nn.Module):
 
 class DeepSetsBank:
     """
-    Lazy-loads per-biomarker DeepSets from MODELS_DIR.
-    Supports files:
-      model_{d:04d}.pt / .pkl
-      deepset_biomarker_{d}.pt / .pkl
+    Lazy-load DeepSets per biomarker:
+      models/model_{d:04d}.pt/.pkl  or  models/deepset_biomarker_{d}.pt/.pkl
     """
-    def __init__(self, D: int, models_dir: str):
-        self.D = D
+    def __init__(self, models_dir: str, show_progress: bool=False):
         self.dir = models_dir
         self.cache: Dict[int, Optional[nn.Module]] = {}
+        self.show_progress = show_progress
 
     def _try_paths(self, d: int) -> List[str]:
         names = [
@@ -232,37 +217,36 @@ class DeepSetsBank:
             return None
 
         ckpt = torch.load(path, map_location=DEVICE)
-        # ckpt may be a dict with 'state_dict' and optional hidden dims
+        # Try standard formats
         if isinstance(ckpt, dict) and "state_dict" in ckpt:
             phi_h = ckpt.get("phi_hidden", 64)
             rho_h = ckpt.get("rho_hidden", 64)
             mdl = DeepSet(phi_dim=phi_h, rho_dim=rho_h).to(DEVICE)
             mdl.load_state_dict(ckpt["state_dict"])
         elif isinstance(ckpt, dict):
-            # assume raw state_dict-compatible
             mdl = DeepSet(phi_dim=ckpt.get("phi_hidden", 64), rho_dim=ckpt.get("rho_hidden", 64)).to(DEVICE)
             mdl.load_state_dict(ckpt)
         else:
-            # Unexpected format -> try to load as state_dict
             mdl = DeepSet().to(DEVICE)
             mdl.load_state_dict(ckpt)
         mdl.eval()
         self.cache[d] = mdl
         return mdl
 
-    def predict_mu_batch(self, elements_batch: List[np.ndarray], selected_idx: Optional[np.ndarray]=None) -> np.ndarray:
+    def predict_mu_batch(self, elements_batch: List[np.ndarray], selected_idx: np.ndarray) -> np.ndarray:
         """
-        elements_batch: list of (T,2) arrays per image
-        selected_idx: biomarkers to predict; if None -> all D
-        Returns: Yhat (N, K) predicted standardized biomarkers
+        elements_batch: list of (7,2) arrays per image
+        selected_idx: biomarkers to predict
+        Returns: Yhat (N, K) standardized biomarkers
         """
-        if selected_idx is None:
-            selected_idx = np.arange(self.D, dtype=int)
         N = len(elements_batch)
         K = len(selected_idx)
         Y = np.zeros((N, K), dtype=np.float32)
+        iterator = enumerate(selected_idx)
+        if self.show_progress:
+            iterator = stqdm(iterator, total=K, desc="Loading DeepSets & predicting")
         with torch.no_grad():
-            for j, d in enumerate(selected_idx):
+            for j, d in iterator:
                 mdl = self._load_one(int(d))
                 if mdl is None:
                     continue
@@ -272,246 +256,212 @@ class DeepSetsBank:
                     Y[i, j] = float(mu.item())
         return Y
 
+# a tiny progress wrapper if user wants (fallback if stqdm not installed)
+def stqdm(it, total=None, desc=""):
+    import itertools, time
+    count = 0
+    ph = st.empty()
+    for x in it:
+        count += 1
+        if total:
+            ph.info(f"{desc}: {count}/{total}")
+        yield x
+    ph.empty()
+
 @st.cache_resource
-def load_deepsets_bank(D: int) -> DeepSetsBank:
-    return DeepSetsBank(D, MODELS_DIR)
+def load_deepsets_bank(models_dir: str, show_progress: bool=False) -> DeepSetsBank:
+    return DeepSetsBank(models_dir, show_progress=show_progress)
 
-DS_BANK = load_deepsets_bank(D_FULL)
+DS_BANK = load_deepsets_bank(MODELS_DIR, SHOW_PROGRESS)
 
 # =========================================================
-# β-WEIGHTED WELLNESS from DeepSets-reconstructed biomarkers
+# 4) MONTE-CARLO (Option B): per-image Shapley on subset wellness
+#     Using per-image biomarkers first, then subset mean → β-weighted
 # =========================================================
-def select_biomarkers_for_speed(beta: np.ndarray, topk: int) -> np.ndarray:
-    if topk is None or topk <= 0 or topk >= len(beta):
-        return np.arange(len(beta), dtype=int)
-    order = np.argsort(-np.abs(beta))[:topk]
-    return order.astype(int)
-
-def compute_wellness_from_Y(Yhat: np.ndarray, beta: np.ndarray, selected_idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def mc_shapley_optionB(
+    Yhat_sel: np.ndarray, betas_sel: np.ndarray, num_perm: int = 512, seed: int = 42
+) -> Tuple[np.ndarray, np.ndarray, float]:
     """
-    Yhat: (N,K) predicted biomarkers (std) for K=|selected_idx|
-    beta: (D,)
-    selected_idx: indices of biomarkers used
-    Returns: (wellness (N,), contributions (N,K)) with contrib = β * ŷ
-    """
-    b = beta[selected_idx].astype(np.float32)  # (K,)
-    contrib = Yhat * b[None, :]
-    wellness = contrib.sum(axis=1)
-    return wellness, contrib
-
-# =========================================================
-# MONTE-CARLO SHAPLEY over image subsets
-# f_k(S) = beta_k^T mean_Yhat(S) for Yhat from DeepSets given each image's CLM
-# =========================================================
-def shapley_wellness_mc_Y(Yhat: np.ndarray, beta: np.ndarray, selected_idx: np.ndarray,
-                          num_perm: int = 512, seed: int = 42) -> Tuple[np.ndarray, float]:
-    """
-    Yhat: (N,K) for selected_idx, K = len(selected_idx)
+    Yhat_sel: (N, K_sel) per-image biomarker preds for current affect
+    betas_sel: (K_sel,) β for the same biomarkers (aligned order)
+    Returns:
+      phi_scalar: (N,) per-image Shapley on wellness
+      phi_biom  : (N, K_sel) per-image, per-biomarker Shapley contributions
+      f_all     : scalar grand wellness on whole batch
     """
     rng = np.random.default_rng(seed)
-    N, K = Yhat.shape
-    b = beta[selected_idx].astype(np.float64)
-    phi = np.zeros(N, dtype=np.float64)
+    N, K = Yhat_sel.shape
+    b = betas_sel.astype(np.float64)
+    phi_scalar = np.zeros(N, dtype=np.float64)
+    phi_biom   = np.zeros((N, K), dtype=np.float64)
 
     for _ in range(num_perm):
         order = rng.permutation(N)
         s = np.zeros(K, dtype=np.float64)
         t = 0
         for idx in order:
-            y_i = Yhat[idx].astype(np.float64)
+            y_i = Yhat_sel[idx].astype(np.float64)
             if t == 0:
-                delta = np.dot(b, y_i)
+                diff_mean = y_i               # (K,)
             else:
-                delta = np.dot(b, ((s + y_i) / (t + 1) - s / t))
-            phi[idx] += delta
+                diff_mean = (s + y_i) / (t + 1) - s / t
+            delta_biom = b * diff_mean        # (K,)
+            phi_scalar[idx] += np.sum(delta_biom)
+            phi_biom[idx]   += delta_biom
             s += y_i
             t += 1
 
-    phi /= num_perm
-    f_all = float(np.dot(b.astype(np.float32), Yhat.mean(axis=0).astype(np.float32)))
-    return phi.astype(np.float32), f_all
-
-# =========================================================
-# CHANNEL-LEVEL SHAP (optional, black-box) on CLM → DeepSets → β·ŷ
-# =========================================================
-def make_background(X: np.ndarray, max_bg: int = 20) -> np.ndarray:
-    if X.shape[0] <= max_bg:
-        return X.copy()
-    idx = np.linspace(0, X.shape[0]-1, max_bg, dtype=int)
-    return X[idx].copy()
-
-def get_channel_explainer_union(X_bg: np.ndarray, beta: np.ndarray, sel_idx: np.ndarray, idx_union: np.ndarray):
-    """
-    f(X_clm) = β_sel^T yhat_sel(X_clm), with yhat from DeepSets using union cache.
-    We re-run DeepSets inside this black-box; for speed, keep background small and nsamples modest.
-    """
-    def f(X):
-        # Build elements for each row, predict over selected biomarkers
-        elems_batch = [clm_to_elements(X[i]) for i in range(X.shape[0])]
-        Y = DS_BANK.predict_mu_batch(elems_batch, selected_idx=sel_idx)  # (B, K_sel)
-        b = beta[sel_idx].astype(np.float32)
-        return (Y @ b).astype(np.float32)
-    return shap.KernelExplainer(f, X_bg)
-
-def compute_channel_shap(explainer, X: np.ndarray, nsamples="auto") -> np.ndarray:
-    shap_vals = explainer.shap_values(X, nsamples=nsamples)
-    return np.array(shap_vals, dtype=np.float32)
+    phi_scalar /= num_perm
+    phi_biom   /= num_perm
+    f_all = float(np.dot(b.astype(np.float32), Yhat_sel.mean(axis=0).astype(np.float32)))
+    return phi_scalar.astype(np.float32), phi_biom.astype(np.float32), f_all
 
 # =========================================================
 # STREAMLIT APP
 # =========================================================
-st.title("Image → CLM → DeepSets biomarkers → β-weighted Wellness (per-image & batch, Monte-Carlo)")
+st.title("Monte‑Carlo Wellness on Random Image Subsets (Option B) — DeepSets + β indices")
 
-uploaded_files = st.file_uploader("Upload landscape images", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
+uploaded = st.file_uploader("Upload images", type=["jpg","jpeg","png"], accept_multiple_files=True)
 
-if uploaded_files:
-    # 1) CLM per image
+if uploaded:
+    # -- 1) CLM per image
     rows = []
     clm_list = []
-    for uf in uploaded_files:
-        im = Image.open(uf)
-        x = preprocess_image(im)
+    for uf in uploaded:
+        img = Image.open(uf)
+        x = preprocess_image(img)
         with torch.no_grad():
             clm_pred = CLM_MODEL(x)                 # [1,7]
             clm_pred = (clm_pred.squeeze(0) * 6.0).clamp(1.0, 6.0)
-            clm_vec = clm_pred.cpu().numpy().astype(np.float32)  # (7,)
-        clm_list.append(clm_vec)
-        row = {"Image": uf.name}
-        for i, lab in enumerate(dimension_labels):
-            row[lab] = float(clm_vec[i])
-        rows.append(row)
+            clm = clm_pred.cpu().numpy().astype(np.float32)
+        rows.append({"Image": uf.name, **{dimension_labels[i]: float(clm[i]) for i in range(7)}})
+        clm_list.append(clm)
 
     batch_clm = np.stack(clm_list, axis=0)  # (N,7)
     N = batch_clm.shape[0]
-    st.write(f"**Images uploaded:** {N}")
+    st.write(f"**Images:** {N}")
 
-    # 2) Elements batch for DeepSets
-    elems_batch = [clm_to_elements(batch_clm[i]) for i in range(N)]  # list of (7,2)
+    # -- 2) Build elements per image (7x2) for DeepSets
+    elems_batch = [clm_to_elements(batch_clm[i]) for i in range(N)]
 
-    # 3) Top-K biomarkers per index + union
-    idx_pos = select_biomarkers_for_speed(BETAS["positive"], TOPK_BIOMARKERS)
-    idx_neg = select_biomarkers_for_speed(BETAS["negative"], TOPK_BIOMARKERS)
-    idx_r   = select_biomarkers_for_speed(BETAS["r"],        TOPK_BIOMARKERS)
+    # -- 3) Load affect specs (indices & betas), create union for a single DeepSets pass
+    idx_pos, betas_pos = AFFECT_SPECS["positive"]
+    idx_neg, betas_neg = AFFECT_SPECS["negative"]
+    idx_r,   betas_r   = AFFECT_SPECS["r"]
+
     idx_union = np.unique(np.concatenate([idx_pos, idx_neg, idx_r])).astype(int)
-    st.caption(f"Using {len(idx_union)} biomarkers (union across indices).")
+    st.caption(f"DeepSets will load {len(idx_union)} biomarker models (union across affects).")
 
-    # 4) Predict biomarkers (DeepSets) on union
+    # -- 4) Predict biomarkers on the union set once
     Yhat_union = DS_BANK.predict_mu_batch(elems_batch, selected_idx=idx_union)  # (N, K_union)
 
-    # 5) Per-image wellness per index
-    wellness = {}
-    contrib_store = {}
-    for name, beta in BETAS.items():
-        sel = idx_pos if name=="positive" else (idx_neg if name=="negative" else idx_r)
-        # map sel -> columns in union
-        col_idx = np.searchsorted(idx_union, sel)
-        Y_sel = Yhat_union[:, col_idx]  # (N, K_sel)
-        W, C = compute_wellness_from_Y(Y_sel, beta, sel)
-        wellness[name] = W
-        contrib_store[name] = (C, sel)
+    # Helpers to slice per affect
+    def slice_affect(Y_union, idx_union, idx_affect, betas_affect):
+        # map affect indices into union columns
+        col = np.searchsorted(idx_union, idx_affect)
+        return Y_union[:, col], betas_affect  # (N,K_sel), (K_sel,)
 
-    # 6) Per-image table
+    # -- 5) If N == 1, do direct wellness (single image case)
     df = pd.DataFrame(rows)
-    df["wellness_positive"] = wellness["positive"]
-    df["wellness_negative"] = wellness["negative"]
-    df["wellness_r"]        = wellness["r"]
-    st.subheader("Per-Image CLM + β-weighted Wellness")
+    if N == 1:
+        st.subheader("Single image detected → Direct DeepSets → β wellness")
+        # Positive
+        Yp, bp = slice_affect(Yhat_union, idx_union, idx_pos, betas_pos)
+        Wp = float(np.dot(Yp[0], bp))
+        Cp = Yp[0] * bp
+        # Negative
+        Yn, bn = slice_affect(Yhat_union, idx_union, idx_neg, betas_neg)
+        Wn = float(np.dot(Yn[0], bn))
+        Cn = Yn[0] * bn
+        # r
+        Yr, br = slice_affect(Yhat_union, idx_union, idx_r, betas_r)
+        Wr = float(np.dot(Yr[0], br))
+        Cr = Yr[0] * br
+
+        df["wellness_positive"] = [Wp]
+        df["wellness_negative"] = [Wn]
+        df["wellness_r"]        = [Wr]
+        st.dataframe(df, use_container_width=True)
+
+        # Show top biomarker contributions
+        def top_contrib(contrib, idx_affect, title, k=25):
+            tdf = pd.DataFrame({"biomarker_index": idx_affect, "contribution": contrib}) \
+                    .sort_values("contribution", key=np.abs, ascending=False).head(k)
+            st.write(title)
+            st.dataframe(tdf, use_container_width=True)
+
+        top_contrib(Cp, idx_pos, "**Positive — top biomarker contributions**")
+        top_contrib(Cn, idx_neg, "**Negative — top biomarker contributions**")
+        top_contrib(Cr, idx_r,   "**r — top biomarker contributions**")
+
+        st.download_button("Download single‑image table (CSV)", df.to_csv(index=False), "single_image_wellness.csv", "text/csv")
+        st.stop()
+
+    # -- 6) N > 1  →  Monte‑Carlo Shapley across images (subset‑based)
+    st.subheader("Subset‑based per‑image wellness via Monte‑Carlo Shapley")
+
+    # Build Y per affect
+    Y_pos, b_pos = slice_affect(Yhat_union, idx_union, idx_pos, betas_pos)
+    Y_neg, b_neg = slice_affect(Yhat_union, idx_union, idx_neg, betas_neg)
+    Y_r,   b_r   = slice_affect(Yhat_union, idx_union, idx_r,   betas_r)
+
+    # Run MC for each affect (Option B)
+    phi_pos, psi_pos, F_pos = mc_shapley_optionB(Y_pos, b_pos, num_perm=NUM_PERM, seed=SHAPLEY_SEED)
+    phi_neg, psi_neg, F_neg = mc_shapley_optionB(Y_neg, b_neg, num_perm=NUM_PERM, seed=SHAPLEY_SEED)
+    phi_r,   psi_r,   F_r   = mc_shapley_optionB(Y_r,   b_r,   num_perm=NUM_PERM, seed=SHAPLEY_SEED)
+
+    # Build output table
+    df["wellness_positive_shap"] = phi_pos
+    df["wellness_negative_shap"] = phi_neg
+    df["wellness_r_shap"]        = phi_r
+
     st.dataframe(df, use_container_width=True)
-    st.download_button("Download per-image table (CSV)", df.to_csv(index=False), "image_wellness.csv", "text/csv")
 
-    # 7) Batch summaries
-    st.subheader("Batch wellness (means)")
-    st.write("- positive = {:.3f} | negative = {:.3f} | r = {:.3f}".format(
-        float(np.mean(wellness["positive"])),
-        float(np.mean(wellness["negative"])),
-        float(np.mean(wellness["r"]))
-    ))
+    st.write(f"**Grand (whole‑batch) wellness** — positive: {F_pos:.3f} | negative: {F_neg:.3f} | r: {F_r:.3f}")
+    eff = (f"sum φ_pos={df['wellness_positive_shap'].sum():.3f} vs f_all={F_pos:.3f}; "
+           f"sum φ_neg={df['wellness_negative_shap'].sum():.3f} vs f_all={F_neg:.3f}; "
+           f"sum φ_r={df['wellness_r_shap'].sum():.3f} vs f_all={F_r:.3f}")
+    st.caption("Shapley efficiency check: " + eff)
 
-    df["wellness_positive_z"] = zscore(wellness["positive"])
-    df["wellness_negative_z"] = zscore(wellness["negative"])
-    df["wellness_r_z"]        = zscore(wellness["r"])
+    # z-scored Shapley wellness (within batch)
+    df["wellness_positive_shap_z"] = zscore(phi_pos)
+    df["wellness_negative_shap_z"] = zscore(phi_neg)
+    df["wellness_r_shap_z"]        = zscore(phi_r)
 
-    # 8) Monte-Carlo Shapley across image subsets
-    if RUN_SHAPLEY:
-        st.markdown("---")
-        st.subheader("Monte-Carlo Shapley wellness across image subsets")
+    st.download_button("Download per‑image Shapley table (CSV)",
+                       df.to_csv(index=False), "image_wellness_shapley.csv", "text/csv")
 
-        phi_batch = {}
-        f_all_batch = {}
-        for name, beta in BETAS.items():
-            sel = idx_pos if name=="positive" else (idx_neg if name=="negative" else idx_r)
-            col_idx = np.searchsorted(idx_union, sel)
-            Y_sel = Yhat_union[:, col_idx]  # (N, K_sel)
-            phi, f_all = shapley_wellness_mc_Y(Y_sel, beta, sel, num_perm=NUM_PERM, seed=SHAPLEY_SEED)
-            phi_batch[name]  = phi
-            f_all_batch[name]= f_all
-
-        df["wellness_positive_shap"] = phi_batch["positive"]
-        df["wellness_negative_shap"] = phi_batch["negative"]
-        df["wellness_r_shap"]        = phi_batch["r"]
-
-        st.write(f"**Grand (whole-batch) wellness** — positive: {f_all_batch['positive']:.3f} | "
-                 f"negative: {f_all_batch['negative']:.3f} | r: {f_all_batch['r']:.3f}")
-
-        eff = (f"sum φ_pos={df['wellness_positive_shap'].sum():.3f} vs f_all={f_all_batch['positive']:.3f}; "
-               f"sum φ_neg={df['wellness_negative_shap'].sum():.3f} vs f_all={f_all_batch['negative']:.3f}; "
-               f"sum φ_r={df['wellness_r_shap'].sum():.3f} vs f_all={f_all_batch['r']:.3f}")
-        st.caption("Shapley efficiency check: " + eff)
-
-        st.download_button("Download per-image table (+Shapley) (CSV)",
-                           df.to_csv(index=False), "image_wellness_shapley.csv", "text/csv")
-
-    # 9) Per-image top biomarker contributions
+    # -- 7) Per‑image per‑biomarker Shapley contributions
     st.markdown("---")
-    st.subheader("Per-image top biomarker contributions (β·ŷ)")
-    sel_img = st.number_input("Select image row (0-based)", min_value=0, max_value=N-1, value=0, step=1)
+    st.subheader("Per‑image per‑biomarker Shapley contributions (β·Δmean biomarker)")
+
+    sel_img = st.number_input("Select image row (0‑based)", min_value=0, max_value=N-1, value=0, step=1)
     img_name = df.loc[sel_img, "Image"]
-    for name in ["positive", "negative", "r"]:
-        C, sel_idx = contrib_store[name]  # (N,K_sel), (K_sel,)
-        rowC = C[sel_img]
-        top = pd.DataFrame({"biomarker_index": sel_idx, "contribution": rowC}) \
-              .sort_values("contribution", key=np.abs, ascending=False) \
-              .head(25)
-        st.write(f"**{name.capitalize()} — top biomarker contributions for {img_name}**")
-        st.dataframe(top, use_container_width=True)
 
-    # 10) Optional channel-level SHAP (CLM → DeepSets → β·ŷ)
-    if RUN_CHANNEL_SHAP:
-        st.markdown("---")
-        st.subheader("Channel-level SHAP for end-to-end wellness")
+    def show_top_biomarker_shapley(psi_img: np.ndarray, idx_affect: np.ndarray, title: str, k: int = 25):
+        # psi_img: (K_sel,) per‑biomarker Shapley for selected image
+        tdf = pd.DataFrame({
+            "biomarker_index": idx_affect,
+            "shapley_contribution": psi_img
+        }).sort_values("shapley_contribution", key=np.abs, ascending=False).head(k)
+        st.write(f"{title} for **{img_name}**")
+        st.dataframe(tdf, use_container_width=True)
 
-        # parse nsamples
-        try:
-            nsamples = int(SHAP_NSAMPLES_TXT)
-        except:
-            nsamples = "auto"
+    show_top_biomarker_shapley(psi_pos[sel_img], idx_pos, "**Positive**")
+    show_top_biomarker_shapley(psi_neg[sel_img], idx_neg, "**Negative**")
+    show_top_biomarker_shapley(psi_r[sel_img],   idx_r,   "**r**")
 
-        X_bg = make_background(batch_clm, max_bg=int(min(SHAP_BG_MAX, N)))
+    # -- 8) Batch‑level biomarker importance (mean |Shapley|)
+    st.markdown("#### Batch biomarker importance (mean |Shapley|)")
+    def batch_biom_importance(psi: np.ndarray, idx_affect: np.ndarray, title: str, k: int = 25):
+        mabs = np.abs(psi).mean(axis=0)     # (K_sel,)
+        tdf = pd.DataFrame({
+            "biomarker_index": idx_affect,
+            "mean_abs_shapley": mabs
+        }).sort_values("mean_abs_shapley", ascending=False).head(k)
+        st.write(title)
+        st.dataframe(tdf, use_container_width=True)
 
-        for name, beta in BETAS.items():
-            sel = idx_pos if name=="positive" else (idx_neg if name=="negative" else idx_r)
-            explainer = get_channel_explainer_union(X_bg, beta, sel, idx_union)
-            shap_vals = compute_channel_shap(explainer, batch_clm, nsamples=nsamples)  # (N,7)
-
-            st.markdown(f"#### {name.capitalize()} — per-image channel SHAP")
-            sel_img_2 = st.number_input(f"[{name}] Select image row (0-based)",
-                                        min_value=0, max_value=N-1, value=0, step=1, key=f"sel_{name}")
-            vals = shap_vals[sel_img_2]
-            barplot(vals, dimension_labels, title=f"{name.capitalize()} SHAP for {df.loc[sel_img_2, 'Image']}")
-
-            st.markdown(f"#### {name.capitalize()} — batch mean channel SHAP")
-            barplot(shap_vals.mean(axis=0), dimension_labels, f"{name.capitalize()} mean SHAP (signed)")
-            barplot(np.abs(shap_vals).mean(axis=0), dimension_labels, f"{name.capitalize()} mean |SHAP|")
-
-            # CSV
-            df_sh = pd.DataFrame(shap_vals, columns=dimension_labels)
-            df_sh.insert(0, "Image", df["Image"])
-            st.download_button(
-                f"Download {name} channel SHAP per image (CSV)",
-                df_sh.to_csv(index=False),
-                file_name=f"channel_shap_{name}.csv",
-                mime="text/csv"
-            )
-
-    st.markdown("---")
-    st.success("Done. Scroll up for tables, plots and CSV downloads.")
+    batch_biom_importance(psi_pos, idx_pos, "**Positive — top biomarkers by mean |Shapley|**")
+    batch_biom_importance(psi_neg, idx_neg, "**Negative — top biomarkers by mean |Shapley|**")
+    batch_biom_importance(psi_r,   idx_r,   "**r — top biomarkers by mean |Shapley|**")
